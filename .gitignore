@@ -10,6 +10,7 @@
 
 # production
 /build
+/splat
 
 # misc
 .DS_Store

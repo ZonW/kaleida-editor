@@ -11,10 +11,11 @@ import { vertexShader, fragmentShader } from './Shader.glsl';
 //1.0 will keep existing screen resolution
 
 const globalResolution = 0.75; //on camera move will render with lower resolution (1x by default)
+const globalBackgroundColor = 0xFFFFFF;//background color
 const antialiasResolution = 2.0; //on camera stop will render with higher resolution (2x default)
 const syncSort = true; //if set to true sorting will be performed on the main thread
 const waitForFullLoadBeforeFirstRender = false; //set to true to wait for full data load before first render
-const sortThreshold = -0.00005;  // Threshold for sorting splats
+const sortThreshold = -0.0005;  // Threshold for sorting splats
 
 
 //fast rendering settings
@@ -26,7 +27,7 @@ const sortThreshold = -0.00005;  // Threshold for sorting splats
 
 //internal
 let mainThreadMatrices = null;
-let cameraMoveFlag=true;
+let cameraMoveFlag = true;
 let renderLock = false;
 
 
@@ -148,17 +149,34 @@ class SplatLoader extends THREE.Loader {
     load(url, onLoad, onProgress, onError) {
         mainThreadMatrices = null;
 
+        if (this.worker) {
+            console.log('Terminating old worker');
+            this.worker.terminate(); // Terminate the old worker
+        }
+
         // Parse the URL to extract the base URL and unique ID
+        //remove from URL params after ? 
+
+        if (url.indexOf('?') >= 0)
+            url = url.substring(0, url.indexOf('?'));
+
         const parsedUrl = new URL(url, window.location.href);
-        const baseUrl = parsedUrl.origin + parsedUrl.pathname;
+        let baseUrl = parsedUrl.origin + parsedUrl.pathname;
+
+        if (window.location.href.indexOf('localhost')>=0) {
+            baseUrl = url;
+        }
+
         const instanceId = parsedUrl.searchParams.get('instanceId');
+
+        this.worker = new Worker(URL.createObjectURL(new Blob(['(', createWorker.toString(), ')(self)'], {
+            type: 'application/javascript'
+        })));
 
         const shared = {
             gl: this.gl,
             url: this.manager.resolveURL(baseUrl),
-            worker: new Worker(URL.createObjectURL(new Blob(['(', createWorker.toString(), ')(self)'], {
-                type: 'application/javascript'
-            }))),
+            worker: this.worker,
             manager: this.manager,
             update: (target, camera, hashed) => update(camera, shared, target, hashed),
             connect: target => connect(shared, target),
@@ -187,6 +205,14 @@ class SplatLoader extends THREE.Loader {
 }
 async function load(shared) {
     shared.manager.itemStart(shared.url);
+
+    if (shared.abortController) {
+        shared.abortController.abort();
+    }
+
+    shared.abortController = new AbortController();
+
+
     const data = await fetch(shared.url);
     if (data.body === null) throw 'Failed to fetch file';
     let _totalDownloadBytes = data.headers.get('Content-Length');
@@ -242,7 +268,7 @@ async function lazyLoad(shared) {
     await waitForTextures();
 
     renderLock = true;
-    cameraMoveFlag=true;
+    cameraMoveFlag = true;
     mainThreadMatrices = new Float32Array(shared.numVertices * 16);
     let offsetMain = 0;
 
@@ -285,18 +311,15 @@ async function lazyLoad(shared) {
                 // Push data only after textures are ready
                 const matrices = pushDataBuffer(shared, buffer.buffer, vertexCount);
 
-                shared.worker.addEventListener('message', (e) => {
-                    if (e.data.method === 'updateMatrices') {
-                        // Update mainThreadMatrices with the matrices received from the worker
-                        mainThreadMatrices = new Float32Array(e.data.matrices);
-                    }
-                });
+
 
                 bytesProcessed += vertexCount * shared.rowLength;
 
                 let onend = (bytesDownloaded - bytesProcessed) == 0;
 
                 const new_matrices = new Float32Array(matrices);
+                if (!mainThreadMatrices)
+                    break;
                 mainThreadMatrices.set(new_matrices, offsetMain);
                 offsetMain += new_matrices.length;
 
@@ -323,7 +346,7 @@ async function lazyLoad(shared) {
             break;
         }
     }
-    if (bytesDownloaded - bytesProcessed > 0) {
+    if (bytesDownloaded - bytesProcessed > 0 && mainThreadMatrices) {
         let concatenatedChunks = new Uint8Array(chunks.reduce((acc, chunk) => acc + chunk.length, 0));
         let offset = 0;
         for (const chunk of chunks) {
@@ -354,6 +377,7 @@ async function lazyLoad(shared) {
         console.log('Full data loaded (1)');
 
     renderLock = false;
+    shared.loading = false;
     shared.loaded = true;
     shared.manager.itemEnd(shared.url);
 }
@@ -381,7 +405,8 @@ function update(camera, shared, target, hashed) {
     }
 }
 function connect(shared, target) {
-    if (!shared.loading) lazyLoad(shared);
+    if (!shared.loading)
+        lazyLoad(shared);
     target.ready = false;
     target.pm = new THREE.Matrix4();
     target.vm1 = new THREE.Matrix4();
@@ -644,24 +669,54 @@ function Splat({
         SplatMaterial
     });
 
+    React.useEffect(() => {
+        const sharedConnection = shared.connect(ref.current);
 
+        // Cleanup on unmount or when src changes
+        return () => {
+            if (shared.worker) {
+                shared.worker.terminate();
+            }
+            sharedConnection();
+        };
+    }, [src]);
 
     const ref = React.useRef(null);
     const gl = useThree(state => state.gl);
 
     gl.autoClear = false;
     gl.autoClearColor = false;
+    gl.setClearColor(globalBackgroundColor, 1.0);
     const glState = useThree(state => state);
     const camera = useThree(state => state.camera);
 
 
     gl.setPixelRatio(pixelRatio);
 
-    const shared = useLoader(SplatLoader, src, loader => {
+    //const url = React.useMemo(() => src, [src]); // Memoize to prevent unnecessary re-renders
+
+    //check if src is not changed
+
+
+
+
+    let forceReloadUrl = `${src}?t=${new Date().getTime()}`;
+    if (!src.startsWith('blob'))
+    {
+        if (window.lastLoadedURL !== src) {
+            window.lastLoadedURL = src;
+            window.lastLoadedURLForce = forceReloadUrl;
+        }
+        else
+            forceReloadUrl = window.lastLoadedURLForce;
+    }
+    else
+        forceReloadUrl = src;
+
+    const shared = useLoader(SplatLoader, forceReloadUrl, loader => {
         loader.gl = gl;
         loader.chunkSize = chunkSize;
     });
-
 
     const isSceneMoving = React.useRef(true);
     let sortInterval = 0;
@@ -681,8 +736,7 @@ function Splat({
         const currentCameraRotation = new THREE.Quaternion().copy(camera.quaternion);
 
         // If camera moved more than a small threshold, update the last move time
-        if (!currentCameraPosition.equals(lastCameraPosition) || !currentCameraRotation.equals(lastCameraRotation)) 
-        {
+        if (!currentCameraPosition.equals(lastCameraPosition) || !currentCameraRotation.equals(lastCameraRotation)) {
             lastMoveTime = Date.now();
             lastCameraPosition.copy(currentCameraPosition);
             lastCameraRotation.copy(currentCameraRotation);
@@ -695,7 +749,7 @@ function Splat({
         return true;
     };
 
-    
+
     useFrame(() => {
 
         if (waitForFullLoadBeforeFirstRender)
@@ -704,31 +758,27 @@ function Splat({
 
         if (ref.current && shared.centerAndScaleTexture && shared.covAndColorTexture) {
             // State to track the camera movement
-           
-            let selectedTarget=renderTarget;
-                
-            if (!checkCameraMovement() && !renderLock)
-            {
-                    //console.log('Camera is not moving');
-                    if (cameraMoveFlag)
-                    {
-                        selectedTarget=renderTargetAntialias;
-                    }
-                    else
-                    {
-                        glState.scene.visible = false;  
-                        return;
-                    }
-                    cameraMoveFlag=false;
+
+            let selectedTarget = renderTarget;
+
+            if (!checkCameraMovement() && !renderLock) {
+                //console.log('Camera is not moving');
+                if (cameraMoveFlag) {
+                    selectedTarget = renderTargetAntialias;
+                }
+                else {
+                    glState.scene.visible = false;
+                    return;
+                }
+                cameraMoveFlag = false;
             }
-            else
-            {
-                cameraMoveFlag=true;
+            else {
+                cameraMoveFlag = true;
                 //console.log('Camera is moving');
             }
 
 
-            if (syncSort && mainThreadMatrices) {                
+            if (syncSort && mainThreadMatrices) {
                 camera.updateMatrixWorld();
                 camera.updateProjectionMatrix();
                 glState.gl.getCurrentViewport(ref.current.viewport);
@@ -771,6 +821,7 @@ function Splat({
 
 
             glState.gl.setRenderTarget(selectedTarget);
+            glState.gl.setClearColor(0,1.0);
             glState.gl.clear();  // Clear the render target
             glState.gl.render(ref.current, camera);  // Render the scene to the render target
 
@@ -781,6 +832,7 @@ function Splat({
             blurAndSharpenMaterial.uniforms.resolution.value.x = glState.size.width;
             blurAndSharpenMaterial.uniforms.resolution.value.y = glState.size.height;
 
+            glState.gl.setClearColor(globalBackgroundColor,1.0);
             glState.gl.clear();  // Clear the screen
             const orthoCamera = new THREE.OrthographicCamera(
                 -1, 1, 1, -1, 0.1, 10

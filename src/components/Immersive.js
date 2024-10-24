@@ -44,6 +44,12 @@ const Immersive = () => {
     const [splatUrl, setSplatUrl] = useState(null);
     const [splatLoad, setSplatLoad] = useState(false);
 
+    const handleSplatUrlLoad = () => {
+        if (splatUrl) {
+            setSplatLoad(prev => prev + 1); // Increment to trigger reload
+        }
+    };
+
     const handleSplatFileChange = async (e) => {
         const file = e.target.files[0];
 
@@ -161,7 +167,7 @@ const Immersive = () => {
                                 />
                                 <br />
                                 <button
-                                    onClick={() => setSplatLoad(true)}
+                                    onClick={() => handleSplatUrlLoad(true)}
                                 >Load</button>
                             </div>
                         </div>
